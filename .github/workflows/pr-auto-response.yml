@@ -9,7 +9,7 @@ on:
 
 concurrency:
   group: pr-auto-response-${{ github.event.pull_request.number || github.event.issue.number || github.run_id }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 permissions: {}
 
@@ -23,7 +23,7 @@ jobs:
   contributor-tier-issues:
     if: >-
       (github.event_name == 'issues' &&
-      (github.event.action == 'opened' || github.event.action == 'reopened' || github.event.action == 'labeled' || github.event.action == 'unlabeled')) ||
+      (github.event.action == 'opened' || github.event.action == 'reopened')) ||
       (github.event_name == 'pull_request_target' &&
       (github.event.action == 'labeled' || github.event.action == 'unlabeled'))
     runs-on: ubuntu-22.04
