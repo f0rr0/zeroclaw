@@ -1,0 +1,76 @@
+name: PR Docker Preview (Fork)
+
+on:
+  pull_request:
+    branches: [master]
+    types: [opened, synchronize, reopened, ready_for_review]
+
+concurrency:
+  group: pr-docker-preview-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  docker-preview:
+    name: Build and Push PR Image
+    if: ${{ github.repository_owner == 'f0rr0' && github.event.pull_request.head.repo.full_name == github.repository && !github.event.pull_request.draft }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Derive image tags
+        id: vars
+        shell: bash
+        run: |
+          set -euo pipefail
+          short_sha="$(echo "${{ github.event.pull_request.head.sha }}" | cut -c1-12)"
+          stable_tag="pr-${{ github.event.pull_request.number }}"
+          sha_tag="${stable_tag}-${short_sha}"
+          image="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
+          echo "image=${image}" >> "$GITHUB_OUTPUT"
+          echo "stable_tag=${stable_tag}" >> "$GITHUB_OUTPUT"
+          echo "sha_tag=${sha_tag}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push PR image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          push: true
+          tags: |
+            ${{ steps.vars.outputs.image }}:${{ steps.vars.outputs.stable_tag }}
+            ${{ steps.vars.outputs.image }}:${{ steps.vars.outputs.sha_tag }}
+          platforms: linux/amd64
+          cache-from: type=gha,scope=pr-docker-preview-${{ github.event.pull_request.number }}
+          cache-to: type=gha,mode=max,scope=pr-docker-preview-${{ github.event.pull_request.number }}
+
+      - name: Publish pull commands
+        shell: bash
+        run: |
+          {
+            echo "### PR image pushed"
+            echo ""
+            echo "- \`${{ steps.vars.outputs.image }}:${{ steps.vars.outputs.stable_tag }}\` (moves with new PR commits)"
+            echo "- \`${{ steps.vars.outputs.image }}:${{ steps.vars.outputs.sha_tag }}\` (immutable commit pin)"
+            echo ""
+            echo "Pull command:"
+            echo "\`docker pull ${{ steps.vars.outputs.image }}:${{ steps.vars.outputs.stable_tag }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
