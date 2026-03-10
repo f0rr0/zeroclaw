@@ -33,8 +33,15 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          branch_slug="$(echo "${{ github.event.pull_request.head.ref }}" \
+            | tr '[:upper:]' '[:lower:]' \
+            | sed -E 's/[^a-z0-9._-]+/-/g; s/^-+//; s/-+$//')"
+          if [ -z "${branch_slug}" ]; then
+            branch_slug="pr"
+          fi
+          branch_slug="${branch_slug:0:40}"
           short_sha="$(echo "${{ github.event.pull_request.head.sha }}" | cut -c1-12)"
-          stable_tag="pr-${{ github.event.pull_request.number }}"
+          stable_tag="pr-${branch_slug}-${{ github.event.pull_request.number }}"
           sha_tag="${stable_tag}-${short_sha}"
           image="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
           echo "image=${image}" >> "$GITHUB_OUTPUT"
