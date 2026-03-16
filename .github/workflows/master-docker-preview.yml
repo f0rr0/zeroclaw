@@ -1,0 +1,74 @@
+name: Master Docker Preview (Fork)
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+concurrency:
+  group: master-docker-preview-${{ github.ref_name }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  docker-master:
+    name: Build and Push Master Image
+    if: ${{ github.repository_owner == 'f0rr0' && github.ref_name == 'master' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Derive image tags
+        id: vars
+        shell: bash
+        run: |
+          set -euo pipefail
+          short_sha="$(echo "${{ github.sha }}" | cut -c1-12)"
+          image="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}"
+          echo "image=${image}" >> "$GITHUB_OUTPUT"
+          echo "stable_tag=master" >> "$GITHUB_OUTPUT"
+          echo "sha_tag=master-${short_sha}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push master image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          push: true
+          tags: |
+            ${{ steps.vars.outputs.image }}:${{ steps.vars.outputs.stable_tag }}
+            ${{ steps.vars.outputs.image }}:${{ steps.vars.outputs.sha_tag }}
+          platforms: linux/amd64
+          cache-from: type=gha,scope=master-docker-preview
+          cache-to: type=gha,mode=max,scope=master-docker-preview
+
+      - name: Publish pull commands
+        shell: bash
+        run: |
+          {
+            echo "### Master image pushed"
+            echo ""
+            echo "- \`${{ steps.vars.outputs.image }}:${{ steps.vars.outputs.stable_tag }}\` (moves with each new master commit)"
+            echo "- \`${{ steps.vars.outputs.image }}:${{ steps.vars.outputs.sha_tag }}\` (immutable commit pin)"
+            echo ""
+            echo "Pull command:"
+            echo "\`docker pull ${{ steps.vars.outputs.image }}:${{ steps.vars.outputs.stable_tag }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
