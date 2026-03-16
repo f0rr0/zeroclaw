@@ -87,6 +87,8 @@ use crate::agent::loop_::{build_tool_instructions, run_tool_call_loop, scrub_cre
 use crate::approval::ApprovalManager;
 use crate::config::Config;
 use crate::identity;
+use crate::meal::distillation::{resolve_distillation_model, run_distillation_batch};
+use crate::meal::store::MealStore;
 use crate::memory::{self, Memory};
 use crate::observability::traits::{ObserverEvent, ObserverMetric};
 use crate::observability::{self, runtime_trace, Observer};
@@ -113,12 +115,17 @@ struct ChannelNotifyObserver {
     inner: Arc<dyn Observer>,
     tx: tokio::sync::mpsc::UnboundedSender<String>,
     tools_used: AtomicBool,
+    emit_notifications: bool,
 }
 
 impl Observer for ChannelNotifyObserver {
     fn record_event(&self, event: &ObserverEvent) {
         if let ObserverEvent::ToolCallStart { tool, arguments } = event {
             self.tools_used.store(true, Ordering::Relaxed);
+            if !self.emit_notifications {
+                self.inner.record_event(event);
+                return;
+            }
             let detail = match arguments {
                 Some(args) if !args.is_empty() => {
                     if let Ok(v) = serde_json::from_str::<serde_json::Value>(args) {
@@ -184,6 +191,9 @@ const CHANNEL_MIN_IN_FLIGHT_MESSAGES: usize = 8;
 const CHANNEL_MAX_IN_FLIGHT_MESSAGES: usize = 64;
 const CHANNEL_TYPING_REFRESH_INTERVAL_SECS: u64 = 4;
 const CHANNEL_HEALTH_HEARTBEAT_SECS: u64 = 30;
+const MEAL_OUTBOX_WORKER_INTERVAL_SECS: u64 = 5;
+const MEAL_OUTBOX_WORKER_BATCH_SIZE: usize = 32;
+const MEAL_DISTILLER_MIN_INTERVAL_SECS: u64 = 15;
 const MODEL_CACHE_FILE: &str = "models_cache.json";
 const MODEL_CACHE_PREVIEW_LIMIT: usize = 10;
 const MEMORY_CONTEXT_MAX_ENTRIES: usize = 4;
@@ -224,12 +234,22 @@ struct ChannelRouteSelection {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum ChannelRuntimeCommand {
+pub(crate) enum ChannelRuntimeCommand {
     ShowProviders,
     SetProvider(String),
     ShowModel,
     SetModel(String),
     NewSession,
+    Instamart(InstamartRuntimeCommand),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum InstamartRuntimeCommand {
+    Help,
+    Connect,
+    Complete { payload: String },
+    Status { scope: String },
+    Disconnect,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -635,7 +655,10 @@ fn supports_runtime_model_switch(channel_name: &str) -> bool {
     matches!(channel_name, "telegram" | "discord" | "matrix")
 }
 
-fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRuntimeCommand> {
+pub(crate) fn parse_runtime_command(
+    channel_name: &str,
+    content: &str,
+) -> Option<ChannelRuntimeCommand> {
     if !supports_runtime_model_switch(channel_name) {
         return None;
     }
@@ -672,7 +695,48 @@ fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRun
             }
         }
         "/new" => Some(ChannelRuntimeCommand::NewSession),
+        "/instamart" => Some(ChannelRuntimeCommand::Instamart(
+            parse_instamart_runtime_command(parts.collect()),
+        )),
         _ => None,
+    }
+}
+
+fn parse_instamart_runtime_command(parts: Vec<&str>) -> InstamartRuntimeCommand {
+    let subcommand = parts
+        .first()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .unwrap_or_else(|| "help".to_string());
+
+    match subcommand.as_str() {
+        "connect" | "auth" | "login" => InstamartRuntimeCommand::Connect,
+        "complete" | "verify" | "finish" => {
+            if parts.len() < 2 {
+                return InstamartRuntimeCommand::Help;
+            }
+            let payload = parts[1..].join(" ").trim().to_string();
+            if payload.is_empty() {
+                InstamartRuntimeCommand::Help
+            } else {
+                InstamartRuntimeCommand::Complete { payload }
+            }
+        }
+        "status" | "who" | "list" => {
+            let scope = parts
+                .get(1)
+                .map(|value| {
+                    let lower = value.trim().to_ascii_lowercase();
+                    if matches!(lower.as_str(), "me" | "self") {
+                        "self".to_string()
+                    } else {
+                        "household".to_string()
+                    }
+                })
+                .unwrap_or_else(|| "household".to_string());
+            InstamartRuntimeCommand::Status { scope }
+        }
+        "disconnect" | "unauth" | "logout" => InstamartRuntimeCommand::Disconnect,
+        _ => InstamartRuntimeCommand::Help,
     }
 }
 
@@ -1317,6 +1381,9 @@ async fn handle_runtime_command_if_needed(
             clear_sender_history(ctx, &sender_key);
             "Conversation history cleared. Starting fresh.".to_string()
         }
+        ChannelRuntimeCommand::Instamart(command) => {
+            handle_instamart_runtime_command(ctx, msg, command).await
+        }
     };
 
     if let Err(err) = channel
@@ -1330,6 +1397,95 @@ async fn handle_runtime_command_if_needed(
     }
 
     true
+}
+
+async fn execute_instamart_runtime_tool(
+    ctx: &ChannelRuntimeContext,
+    payload: serde_json::Value,
+) -> String {
+    let Some(tool) = ctx
+        .tools_registry
+        .iter()
+        .find(|tool| tool.name() == "meal_instamart_account")
+    else {
+        return "Instamart integration is not available. Enable `[meal_agent].enabled = true`."
+            .to_string();
+    };
+
+    match tool.execute(payload).await {
+        Ok(result) => {
+            if result.success {
+                result.output
+            } else {
+                format!(
+                    "⚠️ {}",
+                    result
+                        .error
+                        .unwrap_or_else(|| "Instamart operation failed".to_string())
+                )
+            }
+        }
+        Err(error) => format!("⚠️ Instamart operation failed: {error}"),
+    }
+}
+
+async fn handle_instamart_runtime_command(
+    ctx: &ChannelRuntimeContext,
+    msg: &traits::ChannelMessage,
+    command: InstamartRuntimeCommand,
+) -> String {
+    let usage = "Instamart commands:\n\
+- `/instamart connect`\n\
+- `/instamart complete <callback-url-or-code>`\n\
+- `/instamart status` (household)\n\
+- `/instamart status me`\n\
+- `/instamart disconnect`";
+
+    match command {
+        InstamartRuntimeCommand::Help => usage.to_string(),
+        InstamartRuntimeCommand::Connect => {
+            execute_instamart_runtime_tool(
+                ctx,
+                serde_json::json!({
+                    "action": "connect",
+                    "user_id": msg.sender,
+                }),
+            )
+            .await
+        }
+        InstamartRuntimeCommand::Complete { payload } => {
+            if payload.trim().is_empty() {
+                return usage.to_string();
+            }
+            let args = serde_json::json!({
+                "action": "complete",
+                "user_id": msg.sender,
+                "payload": payload,
+            });
+            execute_instamart_runtime_tool(ctx, args).await
+        }
+        InstamartRuntimeCommand::Status { scope } => {
+            execute_instamart_runtime_tool(
+                ctx,
+                serde_json::json!({
+                    "action": "status",
+                    "user_id": msg.sender,
+                    "scope": scope,
+                }),
+            )
+            .await
+        }
+        InstamartRuntimeCommand::Disconnect => {
+            execute_instamart_runtime_tool(
+                ctx,
+                serde_json::json!({
+                    "action": "disconnect",
+                    "user_id": msg.sender,
+                }),
+            )
+            .await
+        }
+    }
 }
 
 async fn build_memory_context(
@@ -1485,6 +1641,29 @@ fn sanitize_channel_response(response: &str, tools: &[Box<dyn Tool>]) -> String 
         .map(|tool| tool.name().to_ascii_lowercase())
         .collect();
     strip_isolated_tool_json_artifacts(response, &known_tool_names)
+}
+
+fn strip_html_tags_for_telegram(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut in_tag = false;
+    for ch in text.chars() {
+        match ch {
+            '<' => in_tag = true,
+            '>' => {
+                if in_tag {
+                    in_tag = false;
+                } else {
+                    out.push(ch);
+                }
+            }
+            _ => {
+                if !in_tag {
+                    out.push(ch);
+                }
+            }
+        }
+    }
+    out
 }
 
 fn is_tool_call_payload(value: &serde_json::Value, known_tool_names: &HashSet<String>) -> bool {
@@ -1730,6 +1909,137 @@ fn log_worker_join_result(result: Result<(), tokio::task::JoinError>) {
     if let Err(error) = result {
         tracing::error!("Channel message worker crashed: {error}");
     }
+}
+
+fn spawn_meal_outbox_worker(config: Arc<Config>) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let store = MealStore::new(config);
+        if !store.enabled() {
+            return;
+        }
+        let mut interval =
+            tokio::time::interval(Duration::from_secs(MEAL_OUTBOX_WORKER_INTERVAL_SECS));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            match store.process_outbox_events(MEAL_OUTBOX_WORKER_BATCH_SIZE) {
+                Ok(report) => {
+                    if report.applied > 0 || report.retried > 0 || report.failed > 0 {
+                        tracing::info!(
+                            component = "meal_outbox_worker",
+                            applied = report.applied,
+                            retried = report.retried,
+                            failed = report.failed,
+                            "meal outbox reconciliation tick completed"
+                        );
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        component = "meal_outbox_worker",
+                        error = %error,
+                        "meal outbox reconciliation tick failed"
+                    );
+                }
+            }
+        }
+    })
+}
+
+fn spawn_meal_preference_distiller_worker(config: Arc<Config>) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let store = MealStore::new(config.clone());
+        if !store.enabled() {
+            return;
+        }
+
+        let provider_name = config
+            .default_provider
+            .clone()
+            .unwrap_or_else(|| "openrouter".to_string());
+        let provider_options = providers::ProviderRuntimeOptions {
+            auth_profile_override: None,
+            provider_api_url: config.api_url.clone(),
+            zeroclaw_dir: config.config_path.parent().map(PathBuf::from),
+            secrets_encrypt: config.secrets.encrypt,
+            reasoning_enabled: config.runtime.reasoning_enabled,
+            provider_timeout_secs: Some(config.provider_timeout_secs),
+            extra_headers: config.extra_headers.clone(),
+            api_path: config.api_path.clone(),
+        };
+        let provider = match providers::create_provider_with_options(
+            provider_name.as_str(),
+            config.api_key.as_deref(),
+            &provider_options,
+        ) {
+            Ok(provider) => Arc::<dyn Provider>::from(provider),
+            Err(error) => {
+                tracing::warn!(
+                    component = "meal_preference_distiller",
+                    error = %error,
+                    "failed to initialize provider; distiller worker disabled"
+                );
+                return;
+            }
+        };
+
+        let interval_secs = (u64::from(config.meal_agent.distillation_interval_minutes))
+            .saturating_mul(60)
+            .max(MEAL_DISTILLER_MIN_INTERVAL_SECS);
+        let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        let model = resolve_distillation_model(config.as_ref());
+        let min_confidence = config.meal_agent.distillation_min_confidence;
+        let window_limit = config.meal_agent.distillation_window_messages.max(1);
+
+        loop {
+            interval.tick().await;
+            let window = match store.next_distillation_window(window_limit) {
+                Ok(rows) => rows,
+                Err(error) => {
+                    tracing::warn!(
+                        component = "meal_preference_distiller",
+                        error = %error,
+                        "failed loading distillation window"
+                    );
+                    continue;
+                }
+            };
+            if window.is_empty() {
+                continue;
+            }
+            match run_distillation_batch(
+                provider.clone(),
+                &store,
+                model.as_str(),
+                min_confidence,
+                window,
+            )
+            .await
+            {
+                Ok(outcome) => {
+                    tracing::info!(
+                        component = "meal_preference_distiller",
+                        extracted_preferences = outcome.extracted_preferences,
+                        applied_preferences = outcome.applied_preferences,
+                        extracted_episodes = outcome.extracted_episodes,
+                        applied_episodes = outcome.applied_episodes,
+                        extracted_unresolved = outcome.extracted_unresolved,
+                        applied_unresolved = outcome.applied_unresolved,
+                        "distillation tick completed"
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        component = "meal_preference_distiller",
+                        error = %error,
+                        "distillation tick failed"
+                    );
+                }
+            }
+        }
+    })
 }
 
 fn spawn_scoped_typing_task(
@@ -2057,16 +2367,18 @@ async fn process_channel_message(
 
     // Wrap observer to forward tool events as live thread messages
     let (notify_tx, mut notify_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let emit_tool_notifications = msg.channel != "telegram";
     let notify_observer: Arc<ChannelNotifyObserver> = Arc::new(ChannelNotifyObserver {
         inner: Arc::clone(&ctx.observer),
         tx: notify_tx,
         tools_used: AtomicBool::new(false),
+        emit_notifications: emit_tool_notifications,
     });
     let notify_observer_flag = Arc::clone(&notify_observer);
     let notify_channel = target_channel.clone();
     let notify_reply_target = msg.reply_target.clone();
     let notify_thread_root = followup_thread_id(&msg);
-    let notify_task = if msg.channel == "cli" || !ctx.show_tool_calls {
+    let notify_task = if msg.channel == "cli" || !ctx.show_tool_calls || !emit_tool_notifications {
         Some(tokio::spawn(async move {
             while notify_rx.recv().await.is_some() {}
         }))
@@ -2100,28 +2412,31 @@ async fn process_channel_message(
         () = cancellation_token.cancelled() => LlmExecutionResult::Cancelled,
         result = tokio::time::timeout(
             Duration::from_secs(timeout_budget_secs),
-            run_tool_call_loop(
-                active_provider.as_ref(),
-                &mut history,
-                ctx.tools_registry.as_ref(),
-                notify_observer.as_ref() as &dyn Observer,
-                route.provider.as_str(),
-                route.model.as_str(),
-                runtime_defaults.temperature,
-                true,
-                Some(&*ctx.approval_manager),
-                msg.channel.as_str(),
-                &ctx.multimodal,
-                ctx.max_tool_iterations,
-                Some(cancellation_token.clone()),
-                delta_tx,
-                ctx.hooks.as_deref(),
-                if msg.channel == "cli" {
-                    &[]
-                } else {
-                    ctx.non_cli_excluded_tools.as_ref()
-                },
-                ctx.tool_call_dedup_exempt.as_ref(),
+            crate::meal::turn_context::with_turn_source_message_id(
+                msg.id.clone(),
+                run_tool_call_loop(
+                    active_provider.as_ref(),
+                    &mut history,
+                    ctx.tools_registry.as_ref(),
+                    notify_observer.as_ref() as &dyn Observer,
+                    route.provider.as_str(),
+                    route.model.as_str(),
+                    runtime_defaults.temperature,
+                    true,
+                    Some(&*ctx.approval_manager),
+                    msg.channel.as_str(),
+                    &ctx.multimodal,
+                    ctx.max_tool_iterations,
+                    Some(cancellation_token.clone()),
+                    delta_tx,
+                    ctx.hooks.as_deref(),
+                    if msg.channel == "cli" {
+                        &[]
+                    } else {
+                        ctx.non_cli_excluded_tools.as_ref()
+                    },
+                    ctx.tool_call_dedup_exempt.as_ref(),
+                ),
             ),
         ) => LlmExecutionResult::Completed(result),
     };
@@ -2187,6 +2502,7 @@ async fn process_channel_message(
             if let Some(hooks) = &ctx.hooks {
                 match hooks
                     .run_on_message_sending(
+                        Some(msg.id.clone()),
                         msg.channel.clone(),
                         msg.reply_target.clone(),
                         outbound_response.clone(),
@@ -2242,6 +2558,19 @@ async fn process_channel_message(
 
             let sanitized_response =
                 sanitize_channel_response(&outbound_response, ctx.tools_registry.as_ref());
+            let sanitized_response = if msg.channel == "telegram" {
+                let stripped = strip_html_tags_for_telegram(&sanitized_response);
+                if stripped != sanitized_response {
+                    tracing::debug!(
+                        before_len = sanitized_response.chars().count(),
+                        after_len = stripped.chars().count(),
+                        "telegram outbound html tags stripped"
+                    );
+                }
+                stripped
+            } else {
+                sanitized_response
+            };
             let delivered_response = if sanitized_response.is_empty()
                 && !outbound_response.trim().is_empty()
             {
@@ -3786,6 +4115,28 @@ pub async fn start_channels(config: Config) -> Result<()> {
         "schedule",
         "Manage scheduled tasks (create/list/get/cancel/pause/resume). Supports recurring cron and one-shot delays.",
     ));
+    if config.meal_agent.enabled {
+        tool_descs.push((
+            "meal_context_read",
+            "Read household meal context (preferences, history, pantry, feedback, and recent chat ingress).",
+        ));
+        tool_descs.push((
+            "meal_options_rank",
+            "Rank meal options based on household context for grounded recommendations.",
+        ));
+        tool_descs.push((
+            "meal_instamart_account",
+            "Manage per-user Swiggy Instamart MCP auth lifecycle in household chat (connect, complete OAuth, status, disconnect).",
+        ));
+        tool_descs.push((
+            "meal_instamart_sync",
+            "Sync recent Instamart order history for the active user, extract pantry candidates, and persist pantry hints for meal planning.",
+        ));
+        tool_descs.push((
+            "meal_memory_write",
+            "Commit meal decision updates transactionally (preferences, pantry, chosen meals, feedback) with idempotency.",
+        ));
+    }
     tool_descs.push((
         "pushover",
         "Send a Pushover notification to your device. Requires PUSHOVER_TOKEN and PUSHOVER_USER_KEY in .env file.",
@@ -3820,6 +4171,43 @@ pub async fn start_channels(config: Config) -> Result<()> {
         native_tools,
         config.skills.prompt_injection_mode,
     );
+    if config.meal_agent.enabled {
+        system_prompt.push_str(
+            "\n## Meal Agent Policy\n\n\
+             For meal planning, preference recall, pantry-aware suggestions, and meal feedback tracking:\n\
+             - Use `meal_context_read` before making personalized meal claims.\n\
+             - `meal_context_read` can auto-refresh Instamart pantry history for connected users when stale; call it first and use the refreshed context it returns.\n\
+             - Use `meal_options_rank` when recommending meal options or ranking candidates.\n\
+             - For any meal-idea/option request (including short follow-ups like \"any other ideas?\"), do not answer from prior free-text memory: call `meal_context_read` in the same turn, produce/refresh a candidate set, run `meal_options_rank`, then answer.\n\
+             - If recent ingress adds a new hard preference/constraint (for example \"X does not eat eggs\"), invalidate previous candidate lists and regenerate recommendations that satisfy the constraint before replying.\n\
+             - If a user references a person name/alias that does not clearly map to known household participants, ask one concise clarification before treating it as a durable preference. If you proceed with a low-confidence assumption, state that assumption explicitly.\n\
+             - Use `meal_instamart_account` for Instamart account-link actions (`connect`, `complete`, `status`, `disconnect`) in multi-user group chat.\n\
+             - Use `meal_instamart_sync` to force-refresh order history explicitly (for troubleshooting, manual refresh requests, or custom lookback limits).\n\
+             - Use `meal_memory_write` to persist preferences, decisions, pantry hints, and feedback.\n\
+             - When a user shares an image (photo/document converted to an image marker), inspect it first and decide whether it is pantry/fridge/shelf ingredient context.\n\
+             - If the image is pantry-relevant with high confidence, extract concrete visible items (with optional quantity hints like \"~2 tomatoes\", \"half onion\") and persist them with `meal_memory_write` using one or more `record_pantry` operations.\n\
+             - Prefer conservative extraction: do not invent unseen ingredients, brand details, or quantities; keep uncertain items out of commits.\n\
+             - If pantry relevance is unclear or image quality is poor, ask one concise clarification instead of committing uncertain pantry items.\n\
+             - If the image is not pantry-relevant (plated meal, selfie, unrelated scene), do not write pantry hints; continue normal meal assistance.\n\
+             - Treat pantry hints as time-sensitive and uncertain by default: older hints are weaker context, so include fallback options and confirm critical ingredients when needed.\n\
+             - If users ask to connect/disconnect/check Instamart auth, run `meal_instamart_account` instead of free-text instructions.\n\
+             - When a user posts OAuth callback text/URL containing `code=` and `state=` after a connect step, call `meal_instamart_account` with `action=complete`.\n\
+             - For meal suggestions, start with `meal_context_read`; if context still looks stale/empty after that, call `meal_instamart_sync` (with `persist_pantry=true`) and then `meal_context_read` again.\n\
+             - For Instamart-derived pantry writes, set `source` to an order-derived value (e.g. `instamart_order`) and pass `observed_at` from the order timestamp so recency decay is accurate.\n\
+             - For each pantry item committed, set `freshness_profile` as one of: `high` (fresh produce, likely short-lived), `medium` (typical perishables), `low` (sauces/condiments), `very_low` (dry goods/spices).\n\
+             - Never assume ordered items are definitely still available; when order history is old or uncertain, present fallbacks and explicitly mark assumptions.\n\
+             - If the user asks broad meal questions (e.g. \"what should I eat\", \"what to eat now/today\") without a slot, infer the most likely slot from the `Current Date & Time` section and conversational cues.\n\
+             - Default slot windows (local time): breakfast 05:00-10:59, lunch 11:00-15:59, snack 16:00-18:59, dinner 19:00-22:59, late-night snack 23:00-04:59.\n\
+             - When inference is high-confidence, proceed with the inferred slot and state the assumption briefly; only ask a slot-clarifying question when ambiguity is high or the user indicates a different timing.\n\
+             - Keep suggestions grounded in tool output; avoid unsupported claims.\n",
+        );
+        if config.meal_agent.internet_research_enabled {
+            system_prompt.push_str(
+                " - If candidate options are weak/empty or the user asks for fresh ideas, call `web_search_tool` to gather current meal ideas/recipes, optionally `web_fetch` to inspect top sources, then pass the candidate set through `meal_options_rank` before answering.\n\
+                 - Prefer pantry/context-aware search queries (ingredients, cuisine, meal slot, diet constraints) and return concise source-attributed suggestions.\n",
+            );
+        }
+    }
     if !native_tools {
         system_prompt.push_str(&build_tool_instructions(tools_registry.as_ref()));
     }
@@ -3971,6 +4359,11 @@ pub async fn start_channels(config: Config) -> Result<()> {
                     config.hooks.builtin.webhook_audit.clone(),
                 )));
             }
+            if config.meal_agent.enabled {
+                runner.register(Box::new(crate::hooks::builtin::MealIngressHook::new(
+                    Arc::new(config.clone()),
+                )));
+            }
             Some(Arc::new(runner))
         } else {
             None
@@ -4017,8 +4410,28 @@ pub async fn start_channels(config: Config) -> Result<()> {
             tracing::info!("📂 Restored {hydrated} session(s) from disk");
         }
     }
-
+    let meal_outbox_worker = if config.meal_agent.enabled {
+        Some(spawn_meal_outbox_worker(Arc::new(config.clone())))
+    } else {
+        None
+    };
+    let meal_distiller_worker = if config.meal_agent.enabled {
+        Some(spawn_meal_preference_distiller_worker(Arc::new(
+            config.clone(),
+        )))
+    } else {
+        None
+    };
     run_message_dispatch_loop(rx, runtime_ctx, max_in_flight_messages).await;
+
+    if let Some(handle) = meal_outbox_worker {
+        handle.abort();
+        let _ = handle.await;
+    }
+    if let Some(handle) = meal_distiller_worker {
+        handle.abort();
+        let _ = handle.await;
+    }
 
     // Wait for all channel tasks
     for h in handles {
@@ -5420,6 +5833,155 @@ BTC is currently around $65,000 based on latest tool output."#
 
         assert_eq!(default_provider_impl.call_count.load(Ordering::SeqCst), 0);
         assert_eq!(fallback_provider_impl.call_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_handles_instamart_command_without_llm_call() {
+        struct MockInstamartTool {
+            seen: Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+        }
+
+        #[async_trait::async_trait]
+        impl Tool for MockInstamartTool {
+            fn name(&self) -> &str {
+                "meal_instamart_account"
+            }
+
+            fn description(&self) -> &str {
+                "mock"
+            }
+
+            fn parameters_schema(&self) -> serde_json::Value {
+                serde_json::json!({ "type": "object" })
+            }
+
+            async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+                self.seen
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(args);
+                Ok(ToolResult {
+                    success: true,
+                    output: "mock instamart status".to_string(),
+                    error: None,
+                })
+            }
+        }
+
+        let channel_impl = Arc::new(TelegramRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let provider_impl = Arc::new(ModelCaptureProvider::default());
+        let provider: Arc<dyn Provider> = provider_impl.clone();
+        let mut provider_cache_seed: HashMap<String, Arc<dyn Provider>> = HashMap::new();
+        provider_cache_seed.insert("test-provider".to_string(), Arc::clone(&provider));
+
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::clone(&provider),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![Box::new(MockInstamartTool { seen: seen.clone() })]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("default-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: InterruptOnNewMessageConfig {
+                telegram: false,
+                slack: false,
+            },
+            multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+            tool_call_dedup_exempt: Arc::new(Vec::new()),
+            model_routes: Arc::new(Vec::new()),
+            query_classification: crate::config::QueryClassificationConfig::default(),
+            ack_reactions: true,
+            show_tool_calls: true,
+            session_store: None,
+            approval_manager: Arc::new(ApprovalManager::for_non_interactive(
+                &crate::config::AutonomyConfig::default(),
+            )),
+        });
+
+        process_channel_message(
+            runtime_ctx.clone(),
+            traits::ChannelMessage {
+                id: "msg-cmd-instamart-1".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-1".to_string(),
+                content: "/instamart status".to_string(),
+                channel: "telegram".to_string(),
+                timestamp: 1,
+                thread_ts: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let sent = channel_impl.sent_messages.lock().await;
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].contains("mock instamart status"));
+
+        let seen_args = seen.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(seen_args.len(), 1);
+        assert_eq!(
+            seen_args[0].get("action").and_then(|v| v.as_str()),
+            Some("status")
+        );
+        assert_eq!(
+            seen_args[0].get("scope").and_then(|v| v.as_str()),
+            Some("household")
+        );
+        assert_eq!(
+            seen_args[0].get("user_id").and_then(|v| v.as_str()),
+            Some("alice")
+        );
+
+        assert_eq!(provider_impl.call_count.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn parse_runtime_command_instamart_connect() {
+        let parsed = parse_runtime_command("telegram", "/instamart connect");
+        assert_eq!(
+            parsed,
+            Some(ChannelRuntimeCommand::Instamart(
+                InstamartRuntimeCommand::Connect
+            ))
+        );
+    }
+
+    #[test]
+    fn parse_runtime_command_instamart_complete_payload_only() {
+        let parsed = parse_runtime_command(
+            "telegram",
+            "/instamart complete http://127.0.0.1/cb?code=x&state=y",
+        );
+        assert_eq!(
+            parsed,
+            Some(ChannelRuntimeCommand::Instamart(
+                InstamartRuntimeCommand::Complete {
+                    payload: "http://127.0.0.1/cb?code=x&state=y".to_string(),
+                }
+            ))
+        );
     }
 
     #[tokio::test]
@@ -6853,6 +7415,7 @@ BTC is currently around $65,000 based on latest tool output."#
             inner: Arc::new(NoopObserver),
             tx,
             tools_used: AtomicBool::new(false),
+            emit_notifications: true,
         };
 
         let payload = (0..300)

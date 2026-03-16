@@ -276,6 +276,7 @@ impl HookRunner {
 
     pub async fn run_on_message_sending(
         &self,
+        source_message_id: Option<String>,
         mut channel: String,
         mut recipient: String,
         mut content: String,
@@ -283,6 +284,7 @@ impl HookRunner {
         for h in &self.handlers {
             let hook_name = h.name();
             match AssertUnwindSafe(h.on_message_sending(
+                source_message_id.clone(),
                 channel.clone(),
                 recipient.clone(),
                 content.clone(),

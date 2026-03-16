@@ -268,6 +268,10 @@ pub struct Config {
     #[serde(default)]
     pub hooks: HooksConfig,
 
+    /// Meal agent extension configuration (`[meal_agent]`).
+    #[serde(default)]
+    pub meal_agent: MealAgentConfig,
+
     /// Hardware configuration (wizard-driven physical world setup).
     #[serde(default)]
     pub hardware: HardwareConfig,
@@ -2883,6 +2887,124 @@ fn default_max_args_bytes() -> u64 {
     4096
 }
 
+// ── Meal Agent ───────────────────────────────────────────────────
+
+fn default_meal_household_id() -> String {
+    "household_main".to_string()
+}
+
+fn default_meal_db_path() -> String {
+    "state/meal/meal_agent.db".to_string()
+}
+
+fn default_meal_ingress_retention_days() -> u32 {
+    14
+}
+
+fn default_meal_reply_gate_enabled() -> bool {
+    true
+}
+
+fn default_meal_reply_gate_min_confidence() -> f64 {
+    0.72
+}
+
+fn default_meal_reply_gate_window_messages() -> u32 {
+    8
+}
+
+fn default_meal_distillation_interval_minutes() -> u32 {
+    30
+}
+
+fn default_meal_distillation_window_messages() -> u32 {
+    32
+}
+
+fn default_meal_distillation_min_confidence() -> f64 {
+    0.78
+}
+
+fn default_meal_semantic_embeddings_required() -> bool {
+    false
+}
+
+fn default_meal_internet_research_enabled() -> bool {
+    true
+}
+
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct MealAgentConfig {
+    /// Enable meal-agent tools and ingestion.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Household partition key for meal data.
+    #[serde(default = "default_meal_household_id")]
+    pub household_id: String,
+    /// SQLite path for meal-agent state (relative to workspace_dir if not absolute).
+    #[serde(default = "default_meal_db_path")]
+    pub db_path: String,
+    /// Retention window for raw ingress events.
+    #[serde(default = "default_meal_ingress_retention_days")]
+    pub ingress_retention_days: u32,
+    /// Enable non-mention selective reply gating for ambient group messages.
+    #[serde(default = "default_meal_reply_gate_enabled")]
+    pub reply_gate_enabled: bool,
+    /// Optional model override for reply-gate classification.
+    #[serde(default)]
+    pub reply_gate_model: Option<String>,
+    /// Optional model override for preference distillation.
+    #[serde(default)]
+    pub distillation_model: Option<String>,
+    /// Optional model override for pantry image extraction.
+    #[serde(default)]
+    pub pantry_image_model: Option<String>,
+    /// Minimum confidence required for reply-gate allow decisions.
+    #[serde(default = "default_meal_reply_gate_min_confidence")]
+    pub reply_gate_min_confidence: f64,
+    /// Number of recent ingress messages provided to the reply-gate classifier.
+    #[serde(default = "default_meal_reply_gate_window_messages")]
+    pub reply_gate_window_messages: u32,
+    /// Distillation cadence in minutes for converting ambient ingress into durable preference evidence.
+    #[serde(default = "default_meal_distillation_interval_minutes")]
+    pub distillation_interval_minutes: u32,
+    /// Maximum ingress rows to process per distillation run.
+    #[serde(default = "default_meal_distillation_window_messages")]
+    pub distillation_window_messages: u32,
+    /// Minimum confidence accepted by preference distillation.
+    #[serde(default = "default_meal_distillation_min_confidence")]
+    pub distillation_min_confidence: f64,
+    /// Require semantic retrieval embedding configuration at startup.
+    #[serde(default = "default_meal_semantic_embeddings_required")]
+    pub semantic_embeddings_required: bool,
+    /// Allow web_search/web_fetch-backed internet research for candidate generation.
+    #[serde(default = "default_meal_internet_research_enabled")]
+    pub internet_research_enabled: bool,
+}
+
+impl Default for MealAgentConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            household_id: default_meal_household_id(),
+            db_path: default_meal_db_path(),
+            ingress_retention_days: default_meal_ingress_retention_days(),
+            reply_gate_enabled: default_meal_reply_gate_enabled(),
+            reply_gate_model: None,
+            distillation_model: None,
+            pantry_image_model: None,
+            reply_gate_min_confidence: default_meal_reply_gate_min_confidence(),
+            reply_gate_window_messages: default_meal_reply_gate_window_messages(),
+            distillation_interval_minutes: default_meal_distillation_interval_minutes(),
+            distillation_window_messages: default_meal_distillation_window_messages(),
+            distillation_min_confidence: default_meal_distillation_min_confidence(),
+            semantic_embeddings_required: default_meal_semantic_embeddings_required(),
+            internet_research_enabled: default_meal_internet_research_enabled(),
+        }
+    }
+}
+
 impl Default for WebhookAuditConfig {
     fn default() -> Self {
         Self {
@@ -5246,6 +5368,7 @@ impl Default for Config {
             agents: HashMap::new(),
             swarms: HashMap::new(),
             hooks: HooksConfig::default(),
+            meal_agent: MealAgentConfig::default(),
             hardware: HardwareConfig::default(),
             query_classification: QueryClassificationConfig::default(),
             transcription: TranscriptionConfig::default(),
@@ -6213,6 +6336,116 @@ impl Config {
         }
         if self.scheduler.max_tasks == 0 {
             anyhow::bail!("scheduler.max_tasks must be greater than 0");
+        }
+
+        if self.meal_agent.enabled {
+            if self.meal_agent.household_id.trim().is_empty() {
+                anyhow::bail!(
+                    "meal_agent.household_id must not be empty when meal_agent.enabled=true"
+                );
+            }
+            if self.meal_agent.db_path.trim().is_empty() {
+                anyhow::bail!("meal_agent.db_path must not be empty when meal_agent.enabled=true");
+            }
+            if self.meal_agent.ingress_retention_days == 0 {
+                anyhow::bail!(
+                    "meal_agent.ingress_retention_days must be greater than 0 when meal_agent.enabled=true"
+                );
+            }
+            if !(0.0..=1.0).contains(&self.meal_agent.reply_gate_min_confidence) {
+                anyhow::bail!("meal_agent.reply_gate_min_confidence must be between 0.0 and 1.0");
+            }
+            if self.meal_agent.reply_gate_window_messages == 0 {
+                anyhow::bail!(
+                    "meal_agent.reply_gate_window_messages must be greater than 0 when meal_agent.enabled=true"
+                );
+            }
+            if self.meal_agent.distillation_interval_minutes == 0 {
+                anyhow::bail!(
+                    "meal_agent.distillation_interval_minutes must be greater than 0 when meal_agent.enabled=true"
+                );
+            }
+            if self.meal_agent.distillation_window_messages == 0 {
+                anyhow::bail!(
+                    "meal_agent.distillation_window_messages must be greater than 0 when meal_agent.enabled=true"
+                );
+            }
+            if !(0.0..=1.0).contains(&self.meal_agent.distillation_min_confidence) {
+                anyhow::bail!("meal_agent.distillation_min_confidence must be between 0.0 and 1.0");
+            }
+            if !self.hooks.enabled {
+                anyhow::bail!("meal_agent.enabled=true requires hooks.enabled=true");
+            }
+            if self.meal_agent.reply_gate_enabled {
+                let telegram = self.channels_config.telegram.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "meal_agent.reply_gate_enabled=true requires channels_config.telegram"
+                    )
+                })?;
+                if telegram.mention_only {
+                    anyhow::bail!(
+                        "meal_agent.reply_gate_enabled=true requires channels_config.telegram.mention_only=false"
+                    );
+                }
+            }
+            let meal_tools = [
+                "meal_context_read",
+                "meal_options_rank",
+                "meal_memory_write",
+            ];
+            for tool in meal_tools {
+                if self
+                    .autonomy
+                    .non_cli_excluded_tools
+                    .iter()
+                    .any(|excluded| excluded == tool)
+                {
+                    anyhow::bail!(
+                        "meal_agent.enabled=true requires `{tool}` not to be present in autonomy.non_cli_excluded_tools"
+                    );
+                }
+                if !self
+                    .autonomy
+                    .auto_approve
+                    .iter()
+                    .any(|approved| approved == tool)
+                {
+                    anyhow::bail!(
+                        "meal_agent.enabled=true requires `{tool}` in autonomy.auto_approve"
+                    );
+                }
+            }
+            if !self.cron.enabled {
+                anyhow::bail!("meal_agent.enabled=true requires cron.enabled=true");
+            }
+            if self.meal_agent.semantic_embeddings_required {
+                let embedding_model = self.memory.embedding_model.trim();
+                let embedding_provider = self.memory.embedding_provider.trim();
+                let direct_ok = !embedding_model.is_empty()
+                    && !embedding_provider.is_empty()
+                    && !embedding_model.starts_with("hint:");
+                let hinted_ok = embedding_model
+                    .strip_prefix("hint:")
+                    .map(str::trim)
+                    .filter(|hint| !hint.is_empty())
+                    .is_some_and(|hint| {
+                        self.embedding_routes.iter().any(|route| {
+                            route.hint.trim() == hint
+                                && !route.provider.trim().is_empty()
+                                && !route.model.trim().is_empty()
+                        })
+                    });
+                if !direct_ok && !hinted_ok {
+                    anyhow::bail!(
+                        "meal_agent.semantic_embeddings_required=true requires configured memory embedding provider/model or valid embedding_routes hint"
+                    );
+                }
+            }
+            if self.meal_agent.internet_research_enabled && !self.web_search.enabled {
+                anyhow::bail!(
+                    "meal_agent.internet_research_enabled=true requires web_search.enabled=true"
+                );
+            }
         }
 
         // Model routes
@@ -7550,6 +7783,7 @@ default_temperature = 0.7
             agents: HashMap::new(),
             swarms: HashMap::new(),
             hooks: HooksConfig::default(),
+            meal_agent: MealAgentConfig::default(),
             hardware: HardwareConfig::default(),
             transcription: TranscriptionConfig::default(),
             tts: TtsConfig::default(),
@@ -7852,6 +8086,7 @@ tool_dispatcher = "xml"
             agents: HashMap::new(),
             swarms: HashMap::new(),
             hooks: HooksConfig::default(),
+            meal_agent: MealAgentConfig::default(),
             hardware: HardwareConfig::default(),
             transcription: TranscriptionConfig::default(),
             tts: TtsConfig::default(),

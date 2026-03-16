@@ -70,6 +70,7 @@ pub trait HookHandler: Send + Sync {
 
     async fn on_message_sending(
         &self,
+        _source_message_id: Option<String>,
         channel: String,
         recipient: String,
         content: String,

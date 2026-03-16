@@ -90,6 +90,7 @@ mod heartbeat;
 mod hooks;
 mod identity;
 mod integrations;
+mod meal;
 mod memory;
 mod migration;
 mod multimodal;

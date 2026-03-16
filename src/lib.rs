@@ -55,6 +55,7 @@ pub(crate) mod heartbeat;
 pub mod hooks;
 pub(crate) mod identity;
 pub(crate) mod integrations;
+pub(crate) mod meal;
 pub mod memory;
 pub(crate) mod migration;
 pub(crate) mod multimodal;
