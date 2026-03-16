@@ -199,6 +199,16 @@ pub(crate) fn scrub_credentials(input: &str) -> String {
         .to_string()
 }
 
+fn truncate_for_observability(input: &str, max_chars: usize) -> String {
+    let mut chars = input.chars();
+    let out: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        format!("{out}…")
+    } else {
+        out
+    }
+}
+
 /// Default trigger for auto-compaction when non-system message count exceeds this threshold.
 /// Prefer passing the config-driven value via `run_tool_call_loop`; this constant is only
 /// used when callers omit the parameter.
@@ -2822,6 +2832,19 @@ pub(crate) async fn run_tool_call_loop(
                     "arguments": scrub_credentials(&tool_args.to_string()),
                 }),
             );
+            let scrubbed_args = scrub_credentials(&tool_args.to_string());
+            tracing::info!(
+                component = "tool_exec",
+                phase = "start",
+                channel = channel_name,
+                provider = provider_name,
+                model = model,
+                turn_id = %turn_id,
+                iteration = iteration + 1,
+                tool = %tool_name,
+                args = %truncate_for_observability(&scrubbed_args, 800),
+                "tool call start"
+            );
 
             // ── Progress: tool start ────────────────────────────
             if let Some(ref tx) = on_delta {
@@ -2866,6 +2889,7 @@ pub(crate) async fn run_tool_call_loop(
             .zip(executable_calls.iter())
             .zip(executed_outcomes.into_iter())
         {
+            let scrubbed_output = scrub_credentials(&outcome.output);
             runtime_trace::record_event(
                 "tool_call_result",
                 Some(channel_name),
@@ -2878,9 +2902,44 @@ pub(crate) async fn run_tool_call_loop(
                     "iteration": iteration + 1,
                     "tool": call.name.clone(),
                     "duration_ms": outcome.duration.as_millis(),
-                    "output": scrub_credentials(&outcome.output),
+                    "output": scrubbed_output.clone(),
                 }),
             );
+            if outcome.success {
+                tracing::info!(
+                    component = "tool_exec",
+                    phase = "result",
+                    status = "ok",
+                    channel = channel_name,
+                    provider = provider_name,
+                    model = model,
+                    turn_id = %turn_id,
+                    iteration = iteration + 1,
+                    tool = %call.name,
+                    duration_ms = outcome.duration.as_millis(),
+                    output = %truncate_for_observability(&scrubbed_output, 1200),
+                    "tool call result"
+                );
+            } else {
+                tracing::warn!(
+                    component = "tool_exec",
+                    phase = "result",
+                    status = "error",
+                    channel = channel_name,
+                    provider = provider_name,
+                    model = model,
+                    turn_id = %turn_id,
+                    iteration = iteration + 1,
+                    tool = %call.name,
+                    duration_ms = outcome.duration.as_millis(),
+                    error = %truncate_for_observability(
+                        outcome.error_reason.as_deref().unwrap_or(""),
+                        400
+                    ),
+                    output = %truncate_for_observability(&scrubbed_output, 1200),
+                    "tool call result"
+                );
+            }
 
             // ── Hook: after_tool_call (void) ─────────────────
             if let Some(hooks) = hooks {

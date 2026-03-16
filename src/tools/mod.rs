@@ -49,6 +49,11 @@ pub mod mcp_deferred;
 pub mod mcp_protocol;
 pub mod mcp_tool;
 pub mod mcp_transport;
+pub mod meal_context_read;
+pub mod meal_instamart_account;
+pub mod meal_instamart_sync;
+pub mod meal_memory_write;
+pub mod meal_options_rank;
 pub mod memory_forget;
 pub mod memory_recall;
 pub mod memory_store;
@@ -104,6 +109,11 @@ pub use image_info::ImageInfoTool;
 pub use mcp_client::McpRegistry;
 pub use mcp_deferred::{ActivatedToolSet, DeferredMcpToolSet};
 pub use mcp_tool::McpToolWrapper;
+pub use meal_context_read::MealContextReadTool;
+pub use meal_instamart_account::MealInstamartAccountTool;
+pub use meal_instamart_sync::MealInstamartSyncTool;
+pub use meal_memory_write::MealMemoryWriteTool;
+pub use meal_options_rank::MealOptionsRankTool;
 pub use memory_forget::MemoryForgetTool;
 pub use memory_recall::MemoryRecallTool;
 pub use memory_store::MemoryStoreTool;
@@ -346,6 +356,23 @@ pub fn all_tools_with_runtime(
             web_fetch_config.blocked_domains.clone(),
             web_fetch_config.max_response_size,
             web_fetch_config.timeout_secs,
+        )));
+    }
+
+    if config.meal_agent.enabled {
+        tool_arcs.push(Arc::new(MealContextReadTool::new(
+            config.clone(),
+            security.clone(),
+        )));
+        tool_arcs.push(Arc::new(MealOptionsRankTool::new(config.clone())));
+        tool_arcs.push(Arc::new(MealInstamartAccountTool::new(config.clone())));
+        tool_arcs.push(Arc::new(MealInstamartSyncTool::new(
+            config.clone(),
+            security.clone(),
+        )));
+        tool_arcs.push(Arc::new(MealMemoryWriteTool::new(
+            config.clone(),
+            security.clone(),
         )));
     }
 
