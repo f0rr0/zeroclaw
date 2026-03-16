@@ -2796,6 +2796,10 @@ pub struct SlackConfig {
     /// Allowed Slack user IDs. Empty = deny all.
     #[serde(default)]
     pub allowed_users: Vec<String>,
+    /// When true, only respond to messages that @-mention the bot in groups.
+    /// Direct messages remain allowed.
+    #[serde(default)]
+    pub mention_only: bool,
 }
 
 impl ChannelConfig for SlackConfig {
@@ -5724,6 +5728,7 @@ allowed_users = ["@ops:matrix.org"]
         let json = r#"{"bot_token":"xoxb-tok"}"#;
         let parsed: SlackConfig = serde_json::from_str(json).unwrap();
         assert!(parsed.allowed_users.is_empty());
+        assert!(!parsed.mention_only);
     }
 
     #[test]
@@ -5731,6 +5736,14 @@ allowed_users = ["@ops:matrix.org"]
         let json = r#"{"bot_token":"xoxb-tok","allowed_users":["U111"]}"#;
         let parsed: SlackConfig = serde_json::from_str(json).unwrap();
         assert_eq!(parsed.allowed_users, vec!["U111"]);
+        assert!(!parsed.mention_only);
+    }
+
+    #[test]
+    async fn slack_config_deserializes_with_mention_only() {
+        let json = r#"{"bot_token":"xoxb-tok","mention_only":true}"#;
+        let parsed: SlackConfig = serde_json::from_str(json).unwrap();
+        assert!(parsed.mention_only);
     }
 
     #[test]
@@ -5752,6 +5765,7 @@ channel_id = "C123"
 "#;
         let parsed: SlackConfig = toml::from_str(toml_str).unwrap();
         assert!(parsed.allowed_users.is_empty());
+        assert!(!parsed.mention_only);
         assert_eq!(parsed.channel_id.as_deref(), Some("C123"));
     }
 
