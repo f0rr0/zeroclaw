@@ -50,7 +50,7 @@ RUN mkdir -p web/dist && \
         '  </body>' \
         '</html>' > web/dist/index.html; \
     fi
-RUN touch src/main.rs
+RUN find src crates/robot-kit/src benches -type f -exec touch {} +
 RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=zeroclaw-cargo-git,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=zeroclaw-target,target=/app/target,sharing=locked \
